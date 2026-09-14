@@ -38,7 +38,19 @@ public sealed class ChatAgentService(
           description/start_date) rather than creating a new one. Only use entity="plan" or
           entity="itinerary" op="create" when the user clearly asks for a new/separate/another trip —
           phrases like "add", "change", "move", "remove", "swap in", or "plan day 2" about the current
-          trip mean: mutate the active itinerary in place, not create a new one.
+          trip mean: mutate the active itinerary in place, not create a whole new itinerary/plan.
+        - Item op selection within the active itinerary — this is a common mistake, be careful:
+          - "add"/"insert"/"also include" a stop → entity="item" op="create" with the target
+            section_id. This ALWAYS creates a brand-new item, even if the section already has an
+            item at a similar time or of the same kind (e.g. an existing lunch stop). Do not repurpose
+            or overwrite an existing item's id just because it's the closest match in time/category —
+            that silently destroys the user's existing stop instead of adding a new one.
+          - "change"/"replace"/"swap X for Y"/"update" a stop the user is clearly referring to by
+            name or id → entity="item" op="update" on that specific existing item's id.
+          - "remove"/"delete" a stop → entity="item" op="delete" on that specific existing item's id.
+          - If it's ambiguous whether the user wants a new stop or wants to replace an existing one
+            (e.g. there's already an unrelated item at that time), ask a brief clarifying question
+            instead of guessing op="update".
 
         Tools:
         - query_db: look up existing places/itineraries/sections/items before proposing changes.

@@ -49,7 +49,9 @@ export function ChatWidget() {
   const bottomRef = useRef<HTMLDivElement>(null)
   const invalidate = useInvalidateItineraries()
   const approveMut = useApproveAction({
-    mutation: { onSuccess: () => invalidate() },
+    // Pass the itinerary being viewed (if any) so its detail query is invalidated too,
+    // not just the list — otherwise an open ItineraryDetailPage stays stale after approval.
+    mutation: { onSuccess: () => invalidate(itineraryId ?? undefined) },
   })
   const denyMut = useDenyAction()
 
