@@ -16,7 +16,8 @@ public sealed class ProposeMutationTool(
     IPendingActionRepository actions,
     IPlaceRepository places,
     IItemRepository items,
-    ISectionRepository sections) : IAgentTool
+    ISectionRepository sections,
+    ILogger<ProposeMutationTool> logger) : IAgentTool
 {
     public string Name => "propose_itinerary_mutation";
     public string Description =>
@@ -83,16 +84,28 @@ public sealed class ProposeMutationTool(
             : null;
         var hasData = root.TryGetProperty("data", out var dataEl) && dataEl.ValueKind == JsonValueKind.Object;
 
+        logger.LogInformation(
+            "propose_itinerary_mutation called. conversation_id={ConversationId} op={Op} entity={Entity} id={Id} has_data={HasData}",
+            conversationId, op, entity, id, hasData);
+
+        string? RejectWith(string reason)
+        {
+            logger.LogWarning(
+                "propose_itinerary_mutation rejected. conversation_id={ConversationId} op={Op} entity={Entity} id={Id} reason={Reason}",
+                conversationId, op, entity, id, reason);
+            return reason;
+        }
+
         if (op is not ("create" or "update" or "delete"))
-            return JsonSerializer.Serialize(new { error = "op must be create|update|delete" });
+            return JsonSerializer.Serialize(new { error = RejectWith("op must be create|update|delete") });
         if (entity is not ("itinerary" or "section" or "item" or "plan"))
-            return JsonSerializer.Serialize(new { error = "entity must be itinerary|section|item|plan" });
+            return JsonSerializer.Serialize(new { error = RejectWith("entity must be itinerary|section|item|plan") });
         if (entity == "plan" && op != "create")
-            return JsonSerializer.Serialize(new { error = "entity=plan only supports op=create" });
+            return JsonSerializer.Serialize(new { error = RejectWith("entity=plan only supports op=create") });
         if (op is ("update" or "delete") && string.IsNullOrWhiteSpace(id))
-            return JsonSerializer.Serialize(new { error = "id is required for update/delete" });
+            return JsonSerializer.Serialize(new { error = RejectWith("id is required for update/delete") });
         if (op is ("create" or "update") && !hasData)
-            return JsonSerializer.Serialize(new { error = "data is required for create/update" });
+            return JsonSerializer.Serialize(new { error = RejectWith("data is required for create/update") });
 
         var placeIdError = entity switch
         {
@@ -101,13 +114,13 @@ public sealed class ProposeMutationTool(
             _ => null
         };
         if (placeIdError is not null)
-            return JsonSerializer.Serialize(new { error = placeIdError });
+            return JsonSerializer.Serialize(new { error = RejectWith(placeIdError) });
 
         if (entity == "item")
         {
             var sectionIdError = await ValidateItemSectionIdAsync(op!, hasData ? dataEl : default, ct);
             if (sectionIdError is not null)
-                return JsonSerializer.Serialize(new { error = sectionIdError });
+                return JsonSerializer.Serialize(new { error = RejectWith(sectionIdError) });
         }
 
         var descriptionError = entity switch
@@ -117,7 +130,7 @@ public sealed class ProposeMutationTool(
             _ => null
         };
         if (descriptionError is not null)
-            return JsonSerializer.Serialize(new { error = descriptionError });
+            return JsonSerializer.Serialize(new { error = RejectWith(descriptionError) });
 
         var payload = new Dictionary<string, object?>
         {
@@ -139,6 +152,10 @@ public sealed class ProposeMutationTool(
         };
         actions.Add(action);
         await actions.SaveChangesAsync(ct);
+
+        logger.LogInformation(
+            "Pending action queued. conversation_id={ConversationId} action_id={ActionId} op={Op} entity={Entity}",
+            conversationId, action.Id, op, entity);
 
         return JsonSerializer.Serialize(new
         {

@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Text.Json;
 using Microsoft.EntityFrameworkCore;
 using Trippy.Backend.Data;
@@ -11,7 +12,7 @@ namespace Trippy.Backend.Services.Tools;
 /// Queries AppDbContext directly (read-only reporting across aggregates, not a single
 /// repository's responsibility).
 /// </summary>
-public sealed class QueryDbTool(AppDbContext db) : IAgentTool
+public sealed class QueryDbTool(AppDbContext db, ILogger<QueryDbTool> logger) : IAgentTool
 {
     public string Name => "query_db";
     public string Description =>
@@ -39,6 +40,10 @@ public sealed class QueryDbTool(AppDbContext db) : IAgentTool
             ? f
             : default;
 
+        logger.LogInformation(
+            "query_db called. conversation_id={ConversationId} table={Table} filters={Filters} limit={Limit}",
+            conversationId, table, filters.ValueKind == JsonValueKind.Object ? filters.GetRawText() : "{}", limit);
+
         object rows = table switch
         {
             "places" => await QueryPlacesAsync(filters, limit, ct),
@@ -47,6 +52,13 @@ public sealed class QueryDbTool(AppDbContext db) : IAgentTool
             "items" => await QueryItemsAsync(filters, limit, ct),
             _ => new { error = $"Unknown table '{table}'. Use places|itineraries|sections|items" }
         };
+
+        if (rows is ICollection { Count: 0 })
+        {
+            logger.LogWarning(
+                "query_db returned zero rows. conversation_id={ConversationId} table={Table} filters={Filters}",
+                conversationId, table, filters.ValueKind == JsonValueKind.Object ? filters.GetRawText() : "{}");
+        }
 
         return JsonSerializer.Serialize(rows);
     }

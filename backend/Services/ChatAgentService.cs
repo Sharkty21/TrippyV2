@@ -19,7 +19,8 @@ namespace Trippy.Backend.Services;
 public sealed class ChatAgentService(
     IEnumerable<IAgentTool> tools,
     IItineraryService itineraries,
-    IOptions<OpenAiOptions> openAiOptions) : IChatAgent
+    IOptions<OpenAiOptions> openAiOptions,
+    ILogger<ChatAgentService> logger) : IChatAgent
 {
     private const string SystemPrompt = """
         You are Trippy's travel itinerary assistant.
@@ -122,9 +123,14 @@ public sealed class ChatAgentService(
         conversationId ??= Guid.NewGuid().ToString();
         yield return new AgentStreamEvent("conversation", new { conversation_id = conversationId });
 
+        logger.LogInformation(
+            "Chat turn starting. conversation_id={ConversationId} itinerary_id={ItineraryId} message_length={MessageLength}",
+            conversationId, itineraryId, message.Length);
+
         var opts = openAiOptions.Value;
         if (string.IsNullOrWhiteSpace(opts.ApiKey))
         {
+            logger.LogError("Chat turn aborted: OPENAI_API_KEY is not set. conversation_id={ConversationId}", conversationId);
             yield return new AgentStreamEvent("error", new { message = "OPENAI_API_KEY is not set" });
             yield return new AgentStreamEvent("done", new { conversation_id = conversationId });
             yield break;
@@ -157,16 +163,24 @@ public sealed class ChatAgentService(
 
         if (clientError is not null || client is null)
         {
+            logger.LogError(
+                "Chat turn aborted: failed to create OpenAI client. conversation_id={ConversationId} error={Error}",
+                conversationId, clientError);
             yield return new AgentStreamEvent("error", new { message = clientError ?? "Failed to create OpenAI client" });
             yield return new AgentStreamEvent("done", new { conversation_id = conversationId });
             yield break;
         }
 
         var chatOptions = BuildOptions();
+        var lastRound = -1;
+        var finishedWithFinalAnswer = false;
 
         // Cap tool rounds so a bad model loop cannot hang the request forever.
         for (var round = 0; round < 8; round++)
         {
+            lastRound = round;
+            logger.LogDebug(
+                "Model round starting. conversation_id={ConversationId} round={Round}", conversationId, round);
             List<ChatMessage> snapshot;
             lock (history) snapshot = history.ToList();
             if (itineraryContext is not null)
@@ -214,6 +228,9 @@ public sealed class ChatAgentService(
             catch (Exception ex)
             {
                 streamError = ex.Message;
+                logger.LogError(ex,
+                    "Model streaming call threw. conversation_id={ConversationId} round={Round}",
+                    conversationId, round);
             }
 
             foreach (var evt in pendingEvents)
@@ -226,6 +243,11 @@ public sealed class ChatAgentService(
                 yield break;
             }
 
+            logger.LogDebug(
+                "Model round finished. conversation_id={ConversationId} round={Round} finish_reason={FinishReason} " +
+                "tool_calls={ToolCallCount} content_length={ContentLength}",
+                conversationId, round, finishReason, toolCallBuilders.Count, contentBuilder.Length);
+
             if (toolCallBuilders.Count == 0 || finishReason != ChatFinishReason.ToolCalls)
             {
                 var text = contentBuilder.ToString();
@@ -233,6 +255,21 @@ public sealed class ChatAgentService(
                 {
                     lock (history) history.Add(new AssistantChatMessage(text));
                 }
+                else
+                {
+                    // The model stopped without any tool call and without any text — the chat UI
+                    // would otherwise render a permanently blank assistant bubble. Surface it as an
+                    // error so the user sees something went wrong instead of silence.
+                    logger.LogWarning(
+                        "Model finished a round with no content and no tool calls. conversation_id={ConversationId} " +
+                        "round={Round} finish_reason={FinishReason}",
+                        conversationId, round, finishReason);
+                    yield return new AgentStreamEvent("error", new
+                    {
+                        message = "The assistant didn't return a response. Please try again."
+                    });
+                }
+                finishedWithFinalAnswer = true;
                 break;
             }
 
@@ -252,9 +289,16 @@ public sealed class ChatAgentService(
             foreach (var call in assistantToolCalls)
             {
                 var args = call.FunctionArguments.ToString();
+                logger.LogInformation(
+                    "Tool call dispatched. conversation_id={ConversationId} round={Round} tool={Tool} args={Args}",
+                    conversationId, round, call.FunctionName, Truncate(args, 1000));
+
                 string output;
                 if (!_tools.TryGetValue(call.FunctionName, out var tool))
                 {
+                    logger.LogWarning(
+                        "Unknown tool requested by model. conversation_id={ConversationId} tool={Tool}",
+                        conversationId, call.FunctionName);
                     output = JsonSerializer.Serialize(new { error = $"Unknown tool {call.FunctionName}" });
                 }
                 else
@@ -262,9 +306,17 @@ public sealed class ChatAgentService(
                     try
                     {
                         output = await tool.ExecuteAsync(args, conversationId, ct);
+                        var isToolError = LooksLikeError(output);
+                        logger.LogInformation(
+                            "Tool call {Result}. conversation_id={ConversationId} round={Round} tool={Tool} output={Output}",
+                            isToolError ? "returned an error" : "succeeded",
+                            conversationId, round, call.FunctionName, Truncate(output, 1000));
                     }
                     catch (Exception ex)
                     {
+                        logger.LogError(ex,
+                            "Tool call threw. conversation_id={ConversationId} round={Round} tool={Tool} args={Args}",
+                            conversationId, round, call.FunctionName, Truncate(args, 1000));
                         output = JsonSerializer.Serialize(new { error = ex.Message });
                     }
                 }
@@ -274,6 +326,9 @@ public sealed class ChatAgentService(
                 if (call.FunctionName == "propose_itinerary_mutation"
                     && TryParsePendingAction(output, out var pending))
                 {
+                    logger.LogInformation(
+                        "Pending action created. conversation_id={ConversationId} action_id={ActionId}",
+                        conversationId, TryGetActionId(output));
                     yield return pending;
                     continue;
                 }
@@ -286,7 +341,52 @@ public sealed class ChatAgentService(
             }
         }
 
+        if (!finishedWithFinalAnswer)
+        {
+            // Loop ran out of tool-call rounds (round cap hit) without ever producing a final
+            // answer — e.g. the model kept retrying a rejected tool call. Surface this to the
+            // user instead of leaving a blank/stuck-looking assistant bubble.
+            logger.LogWarning(
+                "Chat turn hit the max tool-round cap without a final answer. conversation_id={ConversationId} last_round={LastRound}",
+                conversationId, lastRound);
+            yield return new AgentStreamEvent("error", new
+            {
+                message = "The assistant got stuck trying to complete that request (too many retries). " +
+                           "Please try again or rephrase."
+            });
+        }
+
+        logger.LogInformation("Chat turn finished. conversation_id={ConversationId}", conversationId);
         yield return new AgentStreamEvent("done", new { conversation_id = conversationId });
+    }
+
+    private static bool LooksLikeError(string toolOutput)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(toolOutput);
+            return doc.RootElement.ValueKind == JsonValueKind.Object && doc.RootElement.TryGetProperty("error", out _);
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private static string Truncate(string value, int maxLength) =>
+        value.Length > maxLength ? value[..maxLength] + "…" : value;
+
+    private static string? TryGetActionId(string toolOutput)
+    {
+        try
+        {
+            using var doc = JsonDocument.Parse(toolOutput);
+            return doc.RootElement.TryGetProperty("action_id", out var idEl) ? idEl.GetString() : null;
+        }
+        catch
+        {
+            return null;
+        }
     }
 
     /// <summary>

@@ -14,7 +14,8 @@ namespace Trippy.Backend.Services;
 public sealed class PendingActionExecutor(
     IItineraryService itineraries,
     ISectionService sections,
-    IItemService items)
+    IItemService items,
+    ILogger<PendingActionExecutor> logger)
 {
     public async Task<Dictionary<string, object?>> ExecuteAsync(PendingAction action, CancellationToken ct)
     {
@@ -28,6 +29,10 @@ public sealed class PendingActionExecutor(
             ? idEl.GetString()
             : null;
         var data = root.TryGetProperty("data", out var dataEl) ? dataEl : default;
+
+        logger.LogDebug(
+            "Executing pending action. action_id={ActionId} entity={Entity} op={Op} id={Id}",
+            action.Id, entity, op, id);
 
         return entity switch
         {

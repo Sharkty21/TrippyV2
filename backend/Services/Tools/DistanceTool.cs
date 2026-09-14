@@ -9,7 +9,7 @@ namespace Trippy.Backend.Services.Tools;
 /// scheduling them back-to-back. Uses haversine distance + rough walk/drive speed, mirroring
 /// the frontend's lib/distance.ts estimate so agent and UI travel-time reasoning stay aligned.
 /// </summary>
-public sealed class DistanceTool(AppDbContext db) : IAgentTool
+public sealed class DistanceTool(AppDbContext db, ILogger<DistanceTool> logger) : IAgentTool
 {
     private const double EarthRadiusMiles = 3958.8;
     private const double WalkMph = 3;
@@ -45,7 +45,12 @@ public sealed class DistanceTool(AppDbContext db) : IAgentTool
         var from = await db.Places.FindAsync([fromId], ct);
         var to = await db.Places.FindAsync([toId], ct);
         if (from is null || to is null)
+        {
+            logger.LogWarning(
+                "estimate_travel_time called with unknown place id(s). conversation_id={ConversationId} from_place_id={FromId} (found={FromFound}) to_place_id={ToId} (found={ToFound})",
+                conversationId, fromId, from is not null, toId, to is not null);
             return JsonSerializer.Serialize(new { error = "Unknown place id(s)" });
+        }
 
         var miles = HaversineMiles(from.Latitude, from.Longitude, to.Latitude, to.Longitude);
         var mode = miles > WalkMaxMiles ? "drive" : "walk";

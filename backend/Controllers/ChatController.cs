@@ -8,7 +8,10 @@ namespace Trippy.Backend.Controllers;
 [ApiController]
 [Route("api")]
 [Tags("chat")]
-public sealed class ChatController(IChatAgent agent, IPendingActionService actions) : ControllerBase
+public sealed class ChatController(
+    IChatAgent agent,
+    IPendingActionService actions,
+    ILogger<ChatController> logger) : ControllerBase
 {
     /// <summary>
     /// Streams SSE events: conversation, token, tool, pending_action, error, done.
@@ -33,6 +36,12 @@ public sealed class ChatController(IChatAgent agent, IPendingActionService actio
         await foreach (var evt in agent.StreamAsync(body.Message, body.ConversationId, body.ItineraryId, ct))
         {
             var data = JsonSerializer.Serialize(evt.Data, jsonOptions);
+            if (evt.Event == "error")
+            {
+                logger.LogError(
+                    "Chat stream emitted an error event. conversation_id={ConversationId} data={Data}",
+                    body.ConversationId, data);
+            }
             await Response.WriteAsync($"event: {evt.Event}\ndata: {data}\n\n", ct);
             await Response.Body.FlushAsync(ct);
         }
@@ -54,10 +63,16 @@ public sealed class ChatController(IChatAgent agent, IPendingActionService actio
         try
         {
             var action = await actions.ApproveAsync(actionId, ct);
-            return action is null ? NotFound() : action.ToDto();
+            if (action is null)
+            {
+                logger.LogWarning("Approve failed: action_id={ActionId} not found", actionId);
+                return NotFound();
+            }
+            return action.ToDto();
         }
         catch (InvalidOperationException ex)
         {
+            logger.LogWarning("Approve failed: action_id={ActionId} error={Error}", actionId, ex.Message);
             return BadRequest(new { detail = ex.Message });
         }
     }
@@ -69,10 +84,16 @@ public sealed class ChatController(IChatAgent agent, IPendingActionService actio
         try
         {
             var action = await actions.DenyAsync(actionId, ct);
-            return action is null ? NotFound() : action.ToDto();
+            if (action is null)
+            {
+                logger.LogWarning("Deny failed: action_id={ActionId} not found", actionId);
+                return NotFound();
+            }
+            return action.ToDto();
         }
         catch (InvalidOperationException ex)
         {
+            logger.LogWarning("Deny failed: action_id={ActionId} error={Error}", actionId, ex.Message);
             return BadRequest(new { detail = ex.Message });
         }
     }

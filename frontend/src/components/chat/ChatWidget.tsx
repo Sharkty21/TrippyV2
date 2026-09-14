@@ -1,4 +1,4 @@
-import { MapPinned, MessageCircle, Send, Sparkles, X } from "lucide-react"
+import { CircleAlert, MapPinned, MessageCircle, Send, Sparkles, X } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
@@ -26,6 +26,7 @@ type ChatMessage = {
   role: "user" | "assistant" | "system"
   content: string
   pending?: PendingCard
+  isError?: boolean
 }
 
 function newId() {
@@ -98,62 +99,85 @@ export function ChatWidget() {
 
     const ac = new AbortController()
     abortRef.current = ac
+    // Tracks whether anything (text, an error, or a pending action) was ever surfaced for this
+    // turn, so we can tell a genuinely silent failure apart from a normal response.
+    let gotAnyResponse = false
 
-    await streamChat(
-      text,
-      conversationId,
-      {
-        onConversation: (id) => setConversationId(id),
-        onToken: (content) => {
-          setThinkingMessageId((id) => (id === assistantId ? null : id))
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === assistantId
-                ? { ...msg, content: msg.content + content }
-                : msg,
-            ),
-          )
-        },
-        onPendingAction: (action) => {
-          setThinkingMessageId((id) => (id === assistantId ? null : id))
-          setMessages((prev) => [
-            ...prev,
-            {
-              id: newId(),
-              role: "system",
-              content: action.summary,
-              pending: {
-                action_id: action.action_id,
-                summary: action.summary,
-                command: action.command,
-                status: "pending",
+    function setError(message: string) {
+      gotAnyResponse = true
+      setMessages((prev) =>
+        prev.map((msg) =>
+          msg.id === assistantId
+            ? {
+                ...msg,
+                content: msg.content || message,
+                isError: !msg.content,
+              }
+            : msg,
+        ),
+      )
+    }
+
+    try {
+      await streamChat(
+        text,
+        conversationId,
+        {
+          onConversation: (id) => setConversationId(id),
+          onToken: (content) => {
+            gotAnyResponse = true
+            setThinkingMessageId((id) => (id === assistantId ? null : id))
+            setMessages((prev) =>
+              prev.map((msg) =>
+                msg.id === assistantId
+                  ? { ...msg, content: msg.content + content }
+                  : msg,
+              ),
+            )
+          },
+          onPendingAction: (action) => {
+            gotAnyResponse = true
+            setThinkingMessageId((id) => (id === assistantId ? null : id))
+            setMessages((prev) => [
+              ...prev,
+              {
+                id: newId(),
+                role: "system",
+                content: action.summary,
+                pending: {
+                  action_id: action.action_id,
+                  summary: action.summary,
+                  command: action.command,
+                  status: "pending",
+                },
               },
-            },
-          ])
+            ])
+          },
+          onError: (message) => {
+            setThinkingMessageId((id) => (id === assistantId ? null : id))
+            setError(message)
+          },
+          onDone: () => {
+            setThinkingMessageId((id) => (id === assistantId ? null : id))
+          },
         },
-        onError: (message) => {
-          setThinkingMessageId((id) => (id === assistantId ? null : id))
-          setMessages((prev) =>
-            prev.map((msg) =>
-              msg.id === assistantId
-                ? {
-                    ...msg,
-                    content: msg.content || `Error: ${message}`,
-                  }
-                : msg,
-            ),
-          )
-        },
-        onDone: () => {
-          setThinkingMessageId((id) => (id === assistantId ? null : id))
-          setStreaming(false)
-        },
-      },
-      ac.signal,
-      itineraryId,
-    )
-    setThinkingMessageId((id) => (id === assistantId ? null : id))
-    setStreaming(false)
+        ac.signal,
+        itineraryId,
+      )
+    } catch (err) {
+      // Defensive: streamChat shouldn't throw (it reports failures via onError), but never let an
+      // unexpected error leave the assistant bubble blank and the composer stuck disabled.
+      setThinkingMessageId((id) => (id === assistantId ? null : id))
+      setError(err instanceof Error ? `Chat failed: ${err.message}` : "Chat failed unexpectedly.")
+    } finally {
+      if (!ac.signal.aborted && !gotAnyResponse) {
+        // Nothing was ever emitted for this turn (no token, error, or pending action) — surface a
+        // fallback instead of leaving a permanently blank assistant bubble.
+        setError("Something went wrong and the assistant didn't respond. Please try again.")
+      }
+      setThinkingMessageId((id) => (id === assistantId ? null : id))
+      setStreaming(false)
+    }
   }
 
   async function handleApprove(actionId: string) {
@@ -245,7 +269,8 @@ export function ChatWidget() {
                   className={cn(
                     "min-w-0 rounded-lg px-3 py-2 text-sm wrap-anywhere",
                     msg.role === "user" && "ml-8 bg-teal-600 text-white",
-                    msg.role === "assistant" && "mr-4 bg-stone-100 text-stone-900",
+                    msg.role === "assistant" && !msg.isError && "mr-4 bg-stone-100 text-stone-900",
+                    msg.role === "assistant" && msg.isError && "mr-4 border border-red-200 bg-red-50 text-red-800",
                     msg.role === "system" && "border bg-amber-50 text-stone-800",
                   )}
                 >
@@ -255,7 +280,13 @@ export function ChatWidget() {
                       <span className="animate-shimmer-text">Thinking…</span>
                     </div>
                   )}
-                  {msg.content && (
+                  {msg.content && msg.isError && (
+                    <div className="flex items-start gap-1.5">
+                      <CircleAlert className="mt-0.5 size-3.5 shrink-0 text-red-600" />
+                      <span className="text-sm leading-relaxed">{msg.content}</span>
+                    </div>
+                  )}
+                  {msg.content && !msg.isError && (
                     <div
                       className={cn(
                         "chat-markdown min-w-0 text-sm leading-relaxed wrap-anywhere",
