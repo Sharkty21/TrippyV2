@@ -15,7 +15,8 @@ namespace Trippy.Backend.Services.Tools;
 public sealed class ProposeMutationTool(
     IPendingActionRepository actions,
     IPlaceRepository places,
-    IItemRepository items) : IAgentTool
+    IItemRepository items,
+    ISectionRepository sections) : IAgentTool
 {
     public string Name => "propose_itinerary_mutation";
     public string Description =>
@@ -55,6 +56,9 @@ public sealed class ProposeMutationTool(
                 description =
                     "Fields for create/update. Section create: itinerary_id, date, description. " +
                     "Item create/update: section_id, place_id, description, start_time (\"HH:mm\"). " +
+                    "section_id (REQUIRED on item create): must be a real existing section id — the target " +
+                    "day — e.g. from the ACTIVE ITINERARY CONTEXT's section list or a query_db " +
+                    "table=\"sections\" result; missing/unknown section_id is rejected. " +
                     "Plan create: { itinerary: { name, description, start_date }, days: [ { day_index, description, " +
                     "items: [ { place_id, description, start_time } ] } ] }. " +
                     "place_id (REQUIRED, item and plan items): must be the exact 'id' returned by query_db " +
@@ -98,6 +102,13 @@ public sealed class ProposeMutationTool(
         };
         if (placeIdError is not null)
             return JsonSerializer.Serialize(new { error = placeIdError });
+
+        if (entity == "item")
+        {
+            var sectionIdError = await ValidateItemSectionIdAsync(op!, hasData ? dataEl : default, ct);
+            if (sectionIdError is not null)
+                return JsonSerializer.Serialize(new { error = sectionIdError });
+        }
 
         var descriptionError = entity switch
         {
@@ -161,6 +172,39 @@ public sealed class ProposeMutationTool(
             return $"place_id '{placeId}' does not exist in the places table — you must not invent or guess a " +
                    "place id (e.g. \"place_001\"). Call query_db with table=\"places\" first and use the exact " +
                    "'id' value returned for the place you want, then retry with that id.";
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// For entity=item: on create, section_id is required and must reference a real, existing
+    /// section (a valid GUID). Without this guard, an item create missing/mis-typing section_id
+    /// silently creates an unusable pending action that then throws when a human approves it.
+    /// </summary>
+    private async Task<string?> ValidateItemSectionIdAsync(string op, JsonElement data, CancellationToken ct)
+    {
+        if (op != "create") return null; // update/delete target an existing item's id; section_id isn't required.
+        if (data.ValueKind != JsonValueKind.Object) return null;
+
+        if (!data.TryGetProperty("section_id", out var sectionIdEl) || sectionIdEl.ValueKind != JsonValueKind.String
+            || string.IsNullOrWhiteSpace(sectionIdEl.GetString()))
+        {
+            return "data.section_id is required for item create — use the target day's section_id (see the " +
+                   "ACTIVE ITINERARY CONTEXT's section list, or call query_db with table=\"sections\").";
+        }
+
+        var raw = sectionIdEl.GetString()!;
+        if (!Guid.TryParse(raw, out var sectionGuid))
+        {
+            return $"data.section_id '{raw}' is not a valid id — use the exact section_id from the ACTIVE " +
+                   "ITINERARY CONTEXT or a query_db table=\"sections\" result.";
+        }
+
+        if (await sections.GetAsync(sectionGuid, ct) is null)
+        {
+            return $"data.section_id '{raw}' does not reference an existing section — use the exact section_id " +
+                   "from the ACTIVE ITINERARY CONTEXT or a query_db table=\"sections\" result.";
         }
 
         return null;
