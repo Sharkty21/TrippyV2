@@ -27,6 +27,9 @@ public sealed class ProposeMutationTool(
         "Plan data shape: { itinerary: { name, description, start_date }, " +
         "days: [ { day_index: 0-2, description, items: [ { place_id, description, start_time (\"HH:mm\") } ] } ] }. " +
         "Item create/update data may include start_time (\"HH:mm\", 24h local time) so the UI can build a timeline. " +
+        "place_id (item create, and every plan item) MUST be the exact 'id' value returned by query_db " +
+        "(table='places') — never invent, guess, or reuse a placeholder id like 'place_001'; a mismatched " +
+        "place_id is rejected. Always call query_db to find the real id for the place you mean before proposing. " +
         "Strongly prefer calling query_db on each place first and checking its `hours` AND `seasonal_notes` " +
         "against the exact scheduled day-of-week, time-of-day, and time-of-year before including it — call out " +
         "anything that might be closed or seasonal in the summary. This is not a hard requirement of this tool " +
@@ -54,6 +57,9 @@ public sealed class ProposeMutationTool(
                     "Item create/update: section_id, place_id, description, start_time (\"HH:mm\"). " +
                     "Plan create: { itinerary: { name, description, start_date }, days: [ { day_index, description, " +
                     "items: [ { place_id, description, start_time } ] } ] }. " +
+                    "place_id (REQUIRED, item and plan items): must be the exact 'id' returned by query_db " +
+                    "(table=\"places\") for the intended place — never a made-up/placeholder id like \"place_001\"; " +
+                    "an unrecognized place_id is rejected. " +
                     "Item description (REQUIRED, item and plan items): short concrete advice for that stop — " +
                     "what to order/do/bring/skip, or a timing tip — not just the place name."
             }
@@ -83,6 +89,15 @@ public sealed class ProposeMutationTool(
             return JsonSerializer.Serialize(new { error = "id is required for update/delete" });
         if (op is ("create" or "update") && !hasData)
             return JsonSerializer.Serialize(new { error = "data is required for create/update" });
+
+        var placeIdError = entity switch
+        {
+            "item" => await ValidateItemPlaceIdAsync(op!, hasData ? dataEl : default, ct),
+            "plan" => await ValidatePlanPlaceIdsAsync(hasData ? dataEl : default, ct),
+            _ => null
+        };
+        if (placeIdError is not null)
+            return JsonSerializer.Serialize(new { error = placeIdError });
 
         var descriptionError = entity switch
         {
@@ -122,6 +137,71 @@ public sealed class ProposeMutationTool(
             command = payload,
             message = "Waiting for human approval. Do not claim the change was applied."
         });
+    }
+
+    /// <summary>
+    /// For entity=item: on create, place_id must reference a real row in the places table.
+    /// This is the hard guard against the model fabricating a placeholder id (e.g. "place_001")
+    /// instead of using an id it actually looked up via query_db.
+    /// </summary>
+    private async Task<string?> ValidateItemPlaceIdAsync(string op, JsonElement data, CancellationToken ct)
+    {
+        if (data.ValueKind != JsonValueKind.Object) return null;
+        if (!data.TryGetProperty("place_id", out var placeIdEl) || placeIdEl.ValueKind != JsonValueKind.String)
+        {
+            // place_id is required on create; absence on update just means "leave unchanged".
+            return op == "create"
+                ? "data.place_id is required and must be a real place id from query_db (table=\"places\")."
+                : null;
+        }
+
+        var placeId = placeIdEl.GetString();
+        if (string.IsNullOrWhiteSpace(placeId) || !await places.ExistsAsync(placeId, ct))
+        {
+            return $"place_id '{placeId}' does not exist in the places table — you must not invent or guess a " +
+                   "place id (e.g. \"place_001\"). Call query_db with table=\"places\" first and use the exact " +
+                   "'id' value returned for the place you want, then retry with that id.";
+        }
+
+        return null;
+    }
+
+    /// <summary>
+    /// For entity=plan: checks every items[] entry's place_id, since every plan item is a create.
+    /// </summary>
+    private async Task<string?> ValidatePlanPlaceIdsAsync(JsonElement data, CancellationToken ct)
+    {
+        if (data.ValueKind != JsonValueKind.Object) return null;
+        if (!data.TryGetProperty("days", out var daysEl) || daysEl.ValueKind != JsonValueKind.Array) return null;
+
+        foreach (var dayEl in daysEl.EnumerateArray())
+        {
+            var dayIndex = dayEl.TryGetProperty("day_index", out var diEl) && diEl.ValueKind == JsonValueKind.Number
+                ? diEl.GetInt32()
+                : 0;
+
+            if (!dayEl.TryGetProperty("items", out var itemsEl) || itemsEl.ValueKind != JsonValueKind.Array)
+                continue;
+
+            foreach (var itemEl in itemsEl.EnumerateArray())
+            {
+                if (!itemEl.TryGetProperty("place_id", out var placeIdEl) || placeIdEl.ValueKind != JsonValueKind.String)
+                {
+                    return $"day_index {dayIndex}: data.place_id is required for every plan item and must be a " +
+                           "real place id from query_db (table=\"places\").";
+                }
+
+                var placeId = placeIdEl.GetString();
+                if (string.IsNullOrWhiteSpace(placeId) || !await places.ExistsAsync(placeId, ct))
+                {
+                    return $"day_index {dayIndex}: place_id '{placeId}' does not exist in the places table — you " +
+                           "must not invent or guess a place id (e.g. \"place_001\"). Call query_db with " +
+                           "table=\"places\" first and use the exact 'id' value returned, then retry.";
+                }
+            }
+        }
+
+        return null;
     }
 
     /// <summary>

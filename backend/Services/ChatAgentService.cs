@@ -52,6 +52,13 @@ public sealed class ChatAgentService(
             (e.g. there's already an unrelated item at that time), ask a brief clarifying question
             instead of guessing op="update".
 
+        - place_id, ALWAYS: whenever you set a place_id (item create, or any plan item), it MUST be the
+          exact `id` value returned by query_db for that specific place. Never invent, guess, or reuse
+          a placeholder-looking id such as "place_001" — that is not a real id and will be rejected. If
+          you haven't already retrieved a place's real id in this conversation (e.g. from a prior
+          query_db result or the ACTIVE ITINERARY CONTEXT), call query_db with table="places" (filter by
+          name_contains/city) first and copy its `id` field verbatim before proposing the mutation.
+
         Tools:
         - query_db: look up existing places/itineraries/sections/items before proposing changes.
           Places include hours, duration_minutes, price_range, rating, tags, seasonal_notes,
