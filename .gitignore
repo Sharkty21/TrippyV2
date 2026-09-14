@@ -1,0 +1,25 @@
+# .NET
+**/bin/
+**/obj/
+*.user
+*.suo
+
+# Env / secrets
+.env
+.env.local
+*.pem
+
+# Node
+node_modules/
+frontend/dist/
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.idea/
+.vs/
+*.swp
+*.log
+
+# Build
+backend/wwwroot/
