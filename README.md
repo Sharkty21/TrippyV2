@@ -11,6 +11,45 @@ Travel itinerary planner demo: **.NET 10** API (Controller → Service → Repos
 - SSE streaming for chat tokens / pending actions
 - Orval generates TanStack Query hooks from OpenAPI
 
+```mermaid
+flowchart TB
+  subgraph FE["Frontend — React / Vite / shadcn"]
+    UI["Pages + itinerary UI"]
+    Chat["ChatWidget (SSE)"]
+    Orval["Orval → TanStack Query hooks"]
+    UI --> Orval
+    Chat --> Orval
+  end
+
+  subgraph API["Backend — .NET 10"]
+    CTRL["Controllers /api/*"]
+    SVC["Services"]
+    REPO["Repositories"]
+    AGENT["ChatAgentService"]
+    TOOLS["Tools: query_db · distance · propose_mutation"]
+    HITL["PendingAction → approve/deny → Executor"]
+    CTRL --> SVC --> REPO
+    CTRL --> AGENT
+    AGENT --> TOOLS
+    TOOLS --> HITL
+    HITL --> SVC
+  end
+
+  subgraph DATA["Data"]
+    PG[(Postgres)]
+    SEED["Italy seed · sample itinerary"]
+    SEED --> PG
+  end
+
+  OAI["OpenAI function calling"]
+
+  Orval -->|"REST CRUD"| CTRL
+  Chat -->|"SSE tokens / pending actions"| AGENT
+  AGENT <--> OAI
+  REPO --> PG
+  HITL --> PG
+```
+
 ## Local development
 
 ### 1. Postgres

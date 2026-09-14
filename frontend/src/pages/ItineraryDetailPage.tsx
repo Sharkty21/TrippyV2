@@ -220,16 +220,7 @@ export function ItineraryDetailPage() {
           )}
         >
           <div className="absolute top-3 left-3 z-20 flex gap-2">
-            <Button
-              size="sm"
-              variant={panel === "map" ? "default" : "secondary"}
-              onClick={() => togglePanel("map")}
-              className="shadow"
-            >
-              <MapIcon className="size-3.5" />
-              {panel === "map" ? "Hide map" : "Show map"}
-            </Button>
-            {panelOpen && (
+            {panelOpen ? (
               <Button
                 size="sm"
                 variant="ghost"
@@ -238,6 +229,16 @@ export function ItineraryDetailPage() {
               >
                 <ChevronRight className="size-3.5" />
                 Collapse
+              </Button>
+            ) : (
+              <Button
+                size="sm"
+                variant="secondary"
+                onClick={() => setPanel("map")}
+                className="shadow"
+              >
+                <MapIcon className="size-3.5" />
+                Show map
               </Button>
             )}
           </div>
