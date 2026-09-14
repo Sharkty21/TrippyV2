@@ -174,6 +174,10 @@ public sealed class ChatAgentService(
         var chatOptions = BuildOptions();
         var lastRound = -1;
         var finishedWithFinalAnswer = false;
+        // Detects the model resending byte-identical (tool, args) after a rejection — which just
+        // burns the round cap since nothing about the call changed. See RepeatedFailedCallNotice.
+        string? lastFailedToolName = null;
+        string? lastFailedArgs = null;
 
         // Cap tool rounds so a bad model loop cannot hang the request forever.
         for (var round = 0; round < 8; round++)
@@ -306,11 +310,6 @@ public sealed class ChatAgentService(
                     try
                     {
                         output = await tool.ExecuteAsync(args, conversationId, ct);
-                        var isToolError = LooksLikeError(output);
-                        logger.LogInformation(
-                            "Tool call {Result}. conversation_id={ConversationId} round={Round} tool={Tool} output={Output}",
-                            isToolError ? "returned an error" : "succeeded",
-                            conversationId, round, call.FunctionName, Truncate(output, 1000));
                     }
                     catch (Exception ex)
                     {
@@ -321,7 +320,38 @@ public sealed class ChatAgentService(
                     }
                 }
 
+                var isToolError = LooksLikeError(output);
+                logger.LogInformation(
+                    "Tool call {Result}. conversation_id={ConversationId} round={Round} tool={Tool} output={Output}",
+                    isToolError ? "returned an error" : "succeeded",
+                    conversationId, round, call.FunctionName, Truncate(output, 1000));
+
                 lock (history) history.Add(new ToolChatMessage(call.Id, output));
+
+                // If the model resends the exact same (tool, args) that just failed, the plain
+                // tool-error message alone clearly isn't landing — it likely reads as "still
+                // missing" rather than "wrong shape/location". Inject an explicit nudge so the
+                // model is forced to actually change the call instead of burning the round cap.
+                if (isToolError && call.FunctionName == lastFailedToolName && args == lastFailedArgs)
+                {
+                    lock (history) history.Add(new SystemChatMessage(
+                        "You just resent the exact same tool call (same name, same arguments) that was " +
+                        "just rejected. Resending it unchanged will fail again — it will not be retried " +
+                        "for you. Re-read the error message and change the structure/value of the " +
+                        "argument it complains about (e.g. a field may need to be nested inside `data` " +
+                        "rather than at the top level) before calling this tool again."));
+                }
+
+                if (isToolError)
+                {
+                    lastFailedToolName = call.FunctionName;
+                    lastFailedArgs = args;
+                }
+                else
+                {
+                    lastFailedToolName = null;
+                    lastFailedArgs = null;
+                }
 
                 if (call.FunctionName == "propose_itinerary_mutation"
                     && TryParsePendingAction(output, out var pending))

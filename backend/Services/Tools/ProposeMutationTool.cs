@@ -50,27 +50,67 @@ public sealed class ProposeMutationTool(
             op = new { type = "string", description = "create | update | delete" },
             entity = new { type = "string", description = "itinerary | section | item | plan" },
             summary = new { type = "string", description = "Short human-readable summary of the change. Call out booking_required=true places explicitly." },
-            id = new { type = "string", description = "Entity UUID for update/delete (not used for entity=plan)" },
+            id = new
+            {
+                type = "string",
+                description = "Entity UUID for update/delete (not used for entity=plan). This is the ONLY " +
+                    "identifier that belongs at the top level — every other id (section_id, place_id, " +
+                    "itinerary_id, etc.) belongs INSIDE `data`, never here and never as a sibling of `data`."
+            },
             data = new
             {
                 type = "object",
                 description =
-                    "Fields for create/update. Section create: itinerary_id, date, description. " +
-                    "Item create/update: section_id, place_id, description, start_time (\"HH:mm\"). " +
-                    "section_id (REQUIRED on item create): must be a real existing section id — the target " +
-                    "day — e.g. from the ACTIVE ITINERARY CONTEXT's section list or a query_db " +
-                    "table=\"sections\" result; missing/unknown section_id is rejected. " +
-                    "Plan create: { itinerary: { name, description, start_date }, days: [ { day_index, description, " +
-                    "items: [ { place_id, description, start_time } ] } ] }. " +
-                    "place_id (REQUIRED, item and plan items): must be the exact 'id' returned by query_db " +
-                    "(table=\"places\") for the intended place — never a made-up/placeholder id like \"place_001\"; " +
-                    "an unrecognized place_id is rejected. " +
-                    "Item description (REQUIRED, item and plan items): short concrete advice for that stop — " +
-                    "what to order/do/bring/skip, or a timing tip — not just the place name."
+                    "ALL other fields for create/update go INSIDE this object — never at the top level " +
+                    "alongside `op`/`entity`/`id`. Section create: { itinerary_id, date, description }. " +
+                    "Item create/update: { section_id, place_id, description, start_time }. " +
+                    "Plan create: { itinerary: { name, description, start_date }, days: [ { day_index, " +
+                    "description, items: [ { place_id, description, start_time } ] } ] }.",
+                properties = new
+                {
+                    section_id = new
+                    {
+                        type = "string",
+                        description = "Item create (REQUIRED, must be nested here inside data — not at the " +
+                            "top level): the target day's section id. Must be a real existing section id " +
+                            "from the ACTIVE ITINERARY CONTEXT's section list or a query_db table=\"sections\" " +
+                            "result; missing/unknown section_id is rejected."
+                    },
+                    place_id = new
+                    {
+                        type = "string",
+                        description = "Item create, and every plan item (REQUIRED): must be the exact 'id' " +
+                            "returned by query_db (table=\"places\") for the intended place — never a made-up/" +
+                            "placeholder id like \"place_001\"; an unrecognized place_id is rejected."
+                    },
+                    description = new
+                    {
+                        type = "string",
+                        description = "Item create/update, and every plan item (REQUIRED on create): short " +
+                            "concrete advice for that stop — what to order/do/bring/skip, or a timing tip — " +
+                            "not just the place name."
+                    },
+                    start_time = new
+                    {
+                        type = "string",
+                        description = "Item create/update, and plan items: \"HH:mm\" 24h local time."
+                    },
+                    itinerary_id = new { type = "string", description = "Section create (REQUIRED): the parent itinerary's id." },
+                    date = new { type = "string", description = "Section create: \"yyyy-MM-dd\", must be within the itinerary's 3-day range." }
+                }
             }
         },
         required = new[] { "op", "entity", "summary" }
     };
+
+    /// <summary>
+    /// Fields that only ever belong nested inside `data`, never at the top level. Models
+    /// occasionally place one of these as a sibling of `data` (probably by analogy with the
+    /// top-level `id` field) — instead of rejecting that shape outright and forcing several
+    /// identical, uncorrected retries, we fold it into `data` here and just log that we did so.
+    /// </summary>
+    private static readonly string[] MisplaceableDataKeys =
+        ["section_id", "place_id", "description", "start_time", "itinerary_id", "date"];
 
     public async Task<string> ExecuteAsync(string argumentsJson, string conversationId, CancellationToken ct = default)
     {
@@ -82,8 +122,56 @@ public sealed class ProposeMutationTool(
         var id = root.TryGetProperty("id", out var idEl) && idEl.ValueKind != JsonValueKind.Null
             ? idEl.GetString()
             : null;
-        var hasData = root.TryGetProperty("data", out var dataEl) && dataEl.ValueKind == JsonValueKind.Object;
+        var hasData = root.TryGetProperty("data", out var rawDataEl) && rawDataEl.ValueKind == JsonValueKind.Object;
 
+        // Self-heal: fold any of MisplaceableDataKeys found at the top level (instead of inside
+        // `data`, where they belong) into `data`, so a misplaced field doesn't cause a rejection
+        // the model can't productively act on.
+        JsonDocument? mergedDoc = null;
+        var dataEl = rawDataEl;
+        var foldedKeys = new List<string>();
+        foreach (var key in MisplaceableDataKeys)
+        {
+            if (root.TryGetProperty(key, out var rootVal) && rootVal.ValueKind != JsonValueKind.Null)
+                foldedKeys.Add(key);
+        }
+        if (foldedKeys.Count > 0)
+        {
+            var merged = new Dictionary<string, JsonElement>();
+            if (hasData)
+            {
+                foreach (var prop in rawDataEl.EnumerateObject())
+                    merged[prop.Name] = prop.Value.Clone();
+            }
+            foreach (var key in foldedKeys)
+            {
+                if (!merged.ContainsKey(key) && root.TryGetProperty(key, out var rootVal))
+                    merged[key] = rootVal.Clone();
+            }
+            mergedDoc = JsonDocument.Parse(JsonSerializer.Serialize(merged));
+            dataEl = mergedDoc.RootElement;
+            hasData = true;
+
+            logger.LogWarning(
+                "propose_itinerary_mutation: folded misplaced top-level field(s) {Keys} into `data`. " +
+                "conversation_id={ConversationId} op={Op} entity={Entity}",
+                string.Join(",", foldedKeys), conversationId, op, entity);
+        }
+
+        try
+        {
+            return await ExecuteCoreAsync(op, entity, summary, id, hasData, dataEl, conversationId, ct);
+        }
+        finally
+        {
+            mergedDoc?.Dispose();
+        }
+    }
+
+    private async Task<string> ExecuteCoreAsync(
+        string? op, string? entity, string summary, string? id, bool hasData, JsonElement dataEl,
+        string conversationId, CancellationToken ct)
+    {
         logger.LogInformation(
             "propose_itinerary_mutation called. conversation_id={ConversationId} op={Op} entity={Entity} id={Id} has_data={HasData}",
             conversationId, op, entity, id, hasData);
