@@ -30,7 +30,7 @@ public sealed class ChatController(IChatAgent agent, IPendingActionService actio
             PropertyNamingPolicy = JsonNamingPolicy.SnakeCaseLower
         };
 
-        await foreach (var evt in agent.StreamAsync(body.Message, body.ConversationId, ct))
+        await foreach (var evt in agent.StreamAsync(body.Message, body.ConversationId, body.ItineraryId, ct))
         {
             var data = JsonSerializer.Serialize(evt.Data, jsonOptions);
             await Response.WriteAsync($"event: {evt.Event}\ndata: {data}\n\n", ct);

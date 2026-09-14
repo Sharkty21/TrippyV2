@@ -6,6 +6,13 @@ public class ChatRequest
 {
     [Required] public string Message { get; set; } = "";
     public string? ConversationId { get; set; }
+
+    /// <summary>
+    /// Set when the user is chatting from an itinerary's detail page. The agent is given this
+    /// itinerary's current state as context and is steered towards editing it rather than
+    /// creating a new one.
+    /// </summary>
+    public string? ItineraryId { get; set; }
 }
 
 public class PendingActionRead

@@ -20,6 +20,7 @@ export async function streamChat(
   conversationId: string | null,
   handlers: ChatSseHandlers,
   signal?: AbortSignal,
+  itineraryId?: string | null,
 ): Promise<void> {
   const res = await fetch(`${API_BASE_URL}/api/chat`, {
     method: "POST",
@@ -27,6 +28,7 @@ export async function streamChat(
     body: JSON.stringify({
       message,
       conversation_id: conversationId,
+      itinerary_id: itineraryId ?? null,
     }),
     signal,
   })

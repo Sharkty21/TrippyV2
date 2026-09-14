@@ -10,4 +10,6 @@ export interface ChatRequest {
   message: string;
   /** @nullable */
   conversation_id?: string | null;
+  /** @nullable */
+  itinerary_id?: string | null;
 }

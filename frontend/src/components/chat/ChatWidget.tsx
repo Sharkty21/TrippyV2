@@ -1,12 +1,14 @@
-import { MessageCircle, Send, X } from "lucide-react"
+import { MapPinned, MessageCircle, Send, Sparkles, X } from "lucide-react"
 import { useEffect, useRef, useState } from "react"
 import ReactMarkdown from "react-markdown"
 import remarkGfm from "remark-gfm"
+import { useMatch } from "react-router-dom"
 import { toast } from "sonner"
 
 import { streamChat } from "@/api/chatStream"
-import { useApproveAction, useDenyAction } from "@/api/generated"
+import { useApproveAction, useDenyAction, useGetItinerary } from "@/api/generated"
 import { useInvalidateItineraries } from "@/api/invalidate"
+import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { ScrollArea } from "@/components/ui/scroll-area"
@@ -31,11 +33,18 @@ function newId() {
 }
 
 export function ChatWidget() {
+  const itineraryMatch = useMatch("/itineraries/:id")
+  const itineraryId = itineraryMatch?.params.id ?? null
+  const { data: activeItinerary } = useGetItinerary(itineraryId ?? "", {
+    query: { enabled: Boolean(itineraryId) },
+  })
+
   const [open, setOpen] = useState(false)
   const [conversationId, setConversationId] = useState<string | null>(null)
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [input, setInput] = useState("")
   const [streaming, setStreaming] = useState(false)
+  const [thinkingMessageId, setThinkingMessageId] = useState<string | null>(null)
   const abortRef = useRef<AbortController | null>(null)
   const bottomRef = useRef<HTMLDivElement>(null)
   const invalidate = useInvalidateItineraries()
@@ -56,8 +65,10 @@ export function ChatWidget() {
       {
         id: newId(),
         role: "system",
-        content:
-          "Ask travel questions or request itinerary changes. Database edits need your approval first.",
+        content: activeItinerary
+          ? `Chatting within **${activeItinerary.name}** — asks to add/change/remove stops will edit ` +
+            "this trip. Database edits need your approval first."
+          : "Ask travel questions or request itinerary changes. Database edits need your approval first.",
       },
     ])
     setInput("")
@@ -81,6 +92,7 @@ export function ChatWidget() {
       { id: assistantId, role: "assistant", content: "" },
     ])
     setStreaming(true)
+    setThinkingMessageId(assistantId)
 
     const ac = new AbortController()
     abortRef.current = ac
@@ -91,6 +103,7 @@ export function ChatWidget() {
       {
         onConversation: (id) => setConversationId(id),
         onToken: (content) => {
+          setThinkingMessageId((id) => (id === assistantId ? null : id))
           setMessages((prev) =>
             prev.map((msg) =>
               msg.id === assistantId
@@ -100,6 +113,7 @@ export function ChatWidget() {
           )
         },
         onPendingAction: (action) => {
+          setThinkingMessageId((id) => (id === assistantId ? null : id))
           setMessages((prev) => [
             ...prev,
             {
@@ -116,6 +130,7 @@ export function ChatWidget() {
           ])
         },
         onError: (message) => {
+          setThinkingMessageId((id) => (id === assistantId ? null : id))
           setMessages((prev) =>
             prev.map((msg) =>
               msg.id === assistantId
@@ -127,10 +142,15 @@ export function ChatWidget() {
             ),
           )
         },
-        onDone: () => setStreaming(false),
+        onDone: () => {
+          setThinkingMessageId((id) => (id === assistantId ? null : id))
+          setStreaming(false)
+        },
       },
       ac.signal,
+      itineraryId,
     )
+    setThinkingMessageId((id) => (id === assistantId ? null : id))
     setStreaming(false)
   }
 
@@ -172,28 +192,47 @@ export function ChatWidget() {
   return (
     <>
       {!open && (
-        <Button
-          size="lg"
-          className="fixed right-5 bottom-5 z-[2000] rounded-full shadow-lg"
-          onClick={openChat}
-        >
-          <MessageCircle className="size-5" />
-          AI chat
-        </Button>
+        <div className="fixed right-5 bottom-5 z-[2000] flex flex-col items-end gap-2">
+          {activeItinerary && (
+            <Badge
+              variant="secondary"
+              className="h-auto max-w-[220px] gap-1 rounded-full py-1 shadow-md"
+            >
+              <MapPinned className="size-3" />
+              <span className="truncate">{activeItinerary.name}</span>
+            </Badge>
+          )}
+          <Button size="lg" className="rounded-full shadow-lg" onClick={openChat}>
+            <MessageCircle className="size-5" />
+            AI chat
+          </Button>
+        </div>
       )}
 
       {open && (
         <div className="fixed right-4 bottom-4 z-[2000] flex h-[min(560px,80vh)] w-[min(520px,calc(100vw-2rem))] flex-col overflow-hidden rounded-2xl border bg-white shadow-2xl">
-          <div className="flex items-center justify-between border-b px-4 py-3">
-            <div>
+          <div className="flex items-center justify-between gap-2 border-b px-4 py-3">
+            <div className="min-w-0">
               <p className="font-semibold">New chat</p>
               <p className="text-xs text-muted-foreground">
                 AI answers may be inaccurate
               </p>
             </div>
-            <Button size="icon" variant="ghost" onClick={closeChat}>
-              <X className="size-4" />
-            </Button>
+            <div className="flex items-center gap-2">
+              {activeItinerary && (
+                <Badge
+                  variant="secondary"
+                  className="h-auto max-w-[160px] gap-1 rounded-full py-1"
+                  title={`Editing ${activeItinerary.name}`}
+                >
+                  <MapPinned className="size-3" />
+                  <span className="truncate">{activeItinerary.name}</span>
+                </Badge>
+              )}
+              <Button size="icon" variant="ghost" onClick={closeChat}>
+                <X className="size-4" />
+              </Button>
+            </div>
           </div>
 
           <ScrollArea className="min-h-0 flex-1 px-3 py-3">
@@ -208,6 +247,12 @@ export function ChatWidget() {
                     msg.role === "system" && "border bg-amber-50 text-stone-800",
                   )}
                 >
+                  {msg.id === thinkingMessageId && !msg.content && (
+                    <div className="flex items-center gap-1.5 py-0.5 text-sm font-medium">
+                      <Sparkles className="size-3.5 shrink-0 animate-pulse text-teal-600" />
+                      <span className="animate-shimmer-text">Thinking…</span>
+                    </div>
+                  )}
                   {msg.content && (
                     <div
                       className={cn(

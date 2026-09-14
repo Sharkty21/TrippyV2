@@ -11,5 +11,6 @@ public interface IChatAgent
     IAsyncEnumerable<AgentStreamEvent> StreamAsync(
         string message,
         string? conversationId,
+        string? itineraryId = null,
         CancellationToken ct = default);
 }

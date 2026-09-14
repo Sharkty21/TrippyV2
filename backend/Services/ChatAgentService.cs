@@ -18,6 +18,7 @@ namespace Trippy.Backend.Services;
 /// </summary>
 public sealed class ChatAgentService(
     IEnumerable<IAgentTool> tools,
+    IItineraryService itineraries,
     IOptions<OpenAiOptions> openAiOptions) : IChatAgent
 {
     private const string SystemPrompt = """
@@ -30,6 +31,14 @@ public sealed class ChatAgentService(
         - Every itinerary is EXACTLY 3 days. The user only picks a start date; end_date and the
           3 day sections are created automatically. Never propose more than 3 sections/days for
           one itinerary, and never propose a section date outside start_date..start_date+2.
+        - Active itinerary context: if a message is preceded by an "ACTIVE ITINERARY CONTEXT" system
+          note, the user is on that itinerary's detail page — its id, current sections, and items are
+          given to you there. Default to EDITING that itinerary (entity="item"/"section" with its
+          section/item ids and this itinerary_id, or entity="itinerary" op="update" for its own name/
+          description/start_date) rather than creating a new one. Only use entity="plan" or
+          entity="itinerary" op="create" when the user clearly asks for a new/separate/another trip —
+          phrases like "add", "change", "move", "remove", "swap in", or "plan day 2" about the current
+          trip mean: mutate the active itinerary in place, not create a new one.
 
         Tools:
         - query_db: look up existing places/itineraries/sections/items before proposing changes.
@@ -44,11 +53,16 @@ public sealed class ChatAgentService(
             small proposals so the user reviews one coherent plan.
           - Item create/update can set start_time ("HH:mm"); set it whenever you know a schedule,
             so the UI can render a timeline.
+          - Every item's description must carry real advice (what to order/do/bring, timing), not a
+            generic restatement of the place name — see "Item descriptions" below.
 
         When planning or recommending places, be thoughtful and explicit in your reasoning to the user:
-        - Hours & seasonal notes: check `hours` and `seasonal_notes` against the itinerary's actual
-          dates (season, day of week) before scheduling — call out anything that might be closed or
-          seasonal (e.g. summer-only, closed Mondays).
+        - Hours & seasonal notes: strongly prefer checking `hours` AND `seasonal_notes` (via query_db)
+          against the item's actual scheduled day-of-week, time-of-day, and time-of-year before you
+          schedule it — especially when creating a whole plan. Call out anything that might be closed
+          or seasonal (e.g. summer-only, closed Mondays) in your reply and in the mutation's summary,
+          even when you ultimately find it's open, so the user sees you checked. If you're not fully
+          sure, say so and suggest the user double check, rather than blocking the proposal on it.
         - Distance & pacing: use estimate_travel_time between consecutive stops in a day. Don't
           schedule stops so far apart the day becomes unrealistic, and don't schedule two things
           that overlap once you account for start_time + duration_minutes + travel time to the next
@@ -61,6 +75,14 @@ public sealed class ChatAgentService(
           "romantic", "food") rather than picking generically.
         - Quality: prefer higher-`rating` places when several fit equally well, unless the user
           asked for a specific place by name.
+        - Item descriptions, ALWAYS: every item's `description` must be short, concrete, helpful
+          advice for that stop — never just restate the place name or leave it generic. Tailor it
+          to `type`/`tags`: for restaurants/cafes/bars, name a dish, drink, or specialty to order
+          (use the place's description/tags for hints); for museums/sights, note what not to miss
+          or how to skip lines; for activities, note what to bring or book. Fold in anything
+          time-sensitive from `hours`/`seasonal_notes` (e.g. "arrive by 6pm, kitchen closes early")
+          and a `booking_required` reminder when relevant, so the description alone is useful at a
+          glance. Keep it to 1-2 sentences.
 
         Be concise, practical, and proactive about surfacing tradeoffs (hours, distance, budget,
         booking) rather than silently picking something that conflicts with them.
@@ -75,6 +97,7 @@ public sealed class ChatAgentService(
     public async IAsyncEnumerable<AgentStreamEvent> StreamAsync(
         string message,
         string? conversationId,
+        string? itineraryId = null,
         [EnumeratorCancellation] CancellationToken ct = default)
     {
         conversationId ??= Guid.NewGuid().ToString();
@@ -97,6 +120,10 @@ public sealed class ChatAgentService(
         {
             history.Add(new UserChatMessage(message));
         }
+
+        // Fetched fresh per request (never persisted in `history`) so it always reflects the
+        // itinerary's current state and doesn't go stale or bloat the conversation across turns.
+        var itineraryContext = await BuildItineraryContextAsync(itineraryId, ct);
 
         ChatClient? client = null;
         string? clientError = null;
@@ -123,6 +150,8 @@ public sealed class ChatAgentService(
         {
             List<ChatMessage> snapshot;
             lock (history) snapshot = history.ToList();
+            if (itineraryContext is not null)
+                snapshot.Insert(1, new SystemChatMessage(itineraryContext)); // right after the main system prompt
 
             var contentBuilder = new StringBuilder();
             var toolCallBuilders = new Dictionary<int, ToolCallBuilder>();
@@ -239,6 +268,45 @@ public sealed class ChatAgentService(
         }
 
         yield return new AgentStreamEvent("done", new { conversation_id = conversationId });
+    }
+
+    /// <summary>
+    /// Loads the itinerary the user is currently viewing (if any) and renders it as a compact
+    /// system note so the model can edit it in place instead of proposing a brand new trip.
+    /// Fetched fresh on every call — never cached in conversation history.
+    /// </summary>
+    private async Task<string?> BuildItineraryContextAsync(string? itineraryId, CancellationToken ct)
+    {
+        if (string.IsNullOrWhiteSpace(itineraryId) || !Guid.TryParse(itineraryId, out var id))
+            return null;
+
+        var itin = await itineraries.GetAsync(id, ct);
+        if (itin is null) return null;
+
+        var sb = new StringBuilder();
+        sb.AppendLine("ACTIVE ITINERARY CONTEXT — the user is viewing this itinerary right now.");
+        sb.AppendLine("Prefer editing it (see the \"Active itinerary context\" hard constraint) over creating a new one.");
+        sb.AppendLine($"itinerary_id: {itin.Id}");
+        sb.AppendLine($"name: {itin.Name}");
+        sb.AppendLine($"description: {itin.Description}");
+        sb.AppendLine($"start_date: {itin.StartDate:yyyy-MM-dd}");
+        sb.AppendLine($"end_date: {itin.EndDate:yyyy-MM-dd}");
+
+        foreach (var section in itin.Sections.OrderBy(s => s.Sequence))
+        {
+            sb.AppendLine($"- section_id: {section.Id} | date: {section.Date:yyyy-MM-dd} ({section.Date.DayOfWeek}) | description: {section.Description}");
+            foreach (var item in section.Items.OrderBy(i => i.Sequence))
+            {
+                var startTime = item.StartTime is { } t ? t.ToString("HH:mm") : "unscheduled";
+                sb.AppendLine(
+                    $"  - item_id: {item.Id} | place_id: {item.PlaceId} | place: {item.Place?.Name} | " +
+                    $"start_time: {startTime} | description: {item.Description}");
+            }
+            if (section.Items.Count == 0)
+                sb.AppendLine("  (no items yet)");
+        }
+
+        return sb.ToString();
     }
 
     private static bool TryParsePendingAction(string output, out AgentStreamEvent pending)
